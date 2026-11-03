@@ -187,4 +187,8 @@ select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='ht
   .info-grid{grid-template-columns:1fr}
   .statusbar{display:none}
 }
+/* user management */
+.check-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}
+.check-grid .check{color:var(--t1)}
+@media(max-width:820px){.check-grid{grid-template-columns:1fr}}
 @media print{#app,#toasts{display:none}}
