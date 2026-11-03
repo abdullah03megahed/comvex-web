@@ -1,13 +1,10 @@
 /**
- * db.js – browser port of database_manager.py
- * Same data model + rules as the desktop app, stored in IndexedDB
- * (localStorage fallback). Excel import/export keeps Database.xlsx compatible.
+ * db.js – shared online database (Supabase) with the same data model + rules as the
+ * desktop app. All data is loaded into memory at sign-in (fast search / filter);
+ * every change is written to Supabase first, then mirrored in memory.
+ * Excel import/export keeps Database.xlsx compatible.
  */
-
-const IDB_NAME = "comvex-bms";
-const IDB_STORE = "kv";
-const KEY = "db";
-const LS_KEY = "comvex.db.v1";
+import { supabase } from "./supabase.js";
 
 export const PRODUCT_HEADERS = [
   "Barcode", "Factory", "Factory Code", "Category", "Color", "Size",
@@ -19,56 +16,34 @@ const LIST_SHEETS = {
   colors: ["Colors", "Color Name"],
   sizes: ["Sizes", "Size Name"],
 };
+const PRODUCT_KEYS = ["barcode", "factory", "factory_code", "category", "color", "size", "date", "asin", "noon_sku", "status", "removed_date"];
 
 const empty = () => ({ factories: [], categories: [], colors: [], sizes: [], products: [] });
 let state = empty();
 
-// ── persistence ────────────────────────────────────────────────
-function idb() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(IDB_NAME, 1);
-    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-async function idbGet() {
-  const db = await idb();
-  return new Promise((resolve, reject) => {
-    const r = db.transaction(IDB_STORE).objectStore(IDB_STORE).get(KEY);
-    r.onsuccess = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
-  });
-}
-async function idbSet(value) {
-  const db = await idb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(IDB_STORE, "readwrite");
-    tx.objectStore(IDB_STORE).put(value, KEY);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-let saveTimer = null;
-function persist() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
-    const snapshot = JSON.parse(JSON.stringify(state));
-    try { await idbSet(snapshot); return; } catch { /* fall through */ }
-    try { localStorage.setItem(LS_KEY, JSON.stringify(snapshot)); } catch { /* storage unavailable */ }
-  }, 50);
-}
-
-export async function initDb() {
-  let saved;
-  try { saved = await idbGet(); } catch { /* ignore */ }
-  if (!saved) {
-    try { const raw = localStorage.getItem(LS_KEY); if (raw) saved = JSON.parse(raw); } catch { /* ignore */ }
+// ── loading ────────────────────────────────────────────────────
+const PAGE = 1000; // Supabase returns at most 1000 rows per request
+async function fetchAll(table, order) {
+  const out = [];
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await supabase.from(table).select("*").order(order).range(from, from + PAGE - 1);
+    if (error) throw error;
+    out.push(...data);
+    if (data.length < PAGE) break;
   }
-  state = { ...empty(), ...(saved || {}) };
-  return !!saved;
+  return out;
 }
+const toItem = (r) => ({ row_id: Number(r.row_id), name: String(r.name ?? "") });
+const toProduct = (r) => { const p = {}; for (const k of PRODUCT_KEYS) p[k] = String(r[k] ?? ""); return p; };
+
+export async function reload() {
+  const [f, c, col, s, p] = await Promise.all([
+    fetchAll("factories", "row_id"), fetchAll("categories", "row_id"),
+    fetchAll("colors", "row_id"), fetchAll("sizes", "row_id"), fetchAll("products", "seq"),
+  ]);
+  state = { factories: f.map(toItem), categories: c.map(toItem), colors: col.map(toItem), sizes: s.map(toItem), products: p.map(toProduct) };
+}
+export const initDb = reload;
 
 // ── helpers ────────────────────────────────────────────────────
 const norm = (s) => String(s ?? "").trim().toLowerCase();
@@ -76,8 +51,9 @@ const nowStr = () => {
   const d = new Date(), p = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 };
-const nextId = (list) => (list.length ? Math.max(...list.map((x) => Number(x.row_id))) + 1 : 1);
 const isRemoved = (p) => norm(p.status) === "removed";
+const NO_PERM = "You don't have permission to do that (or it was already changed by someone else — try Refresh).";
+const errText = (e) => (e?.code === "42501" || /row-level security|permission/i.test(e?.message || "") ? NO_PERM : e?.message || "Server error.");
 
 export function buildSq(p) {
   const g = (k) => String(p[k] ?? "").trim();
@@ -105,36 +81,42 @@ export function matchProducts(products, query) {
 
 // ── generic list CRUD (factories / categories / colors / sizes) ─
 const LABEL = { factories: "Factory", categories: "Category", colors: "Color", sizes: "Size" };
+const dupMsg = (kind) => `${LABEL[kind]} ${kind === "factories" ? "name " : ""}already exists.`;
 
 export const getAll = (kind) => state[kind].map((x) => ({ ...x }));
 
-export function addItem(kind, name) {
+export async function addItem(kind, name) {
   name = String(name ?? "").trim();
   const label = LABEL[kind];
   if (!name) return [false, `${label} name cannot be empty.`];
-  if (state[kind].some((x) => norm(x.name) === norm(name))) return [false, `${label} ${kind === "factories" ? "name " : ""}already exists.`];
-  state[kind].push({ row_id: nextId(state[kind]), name });
-  persist();
+  if (state[kind].some((x) => norm(x.name) === norm(name))) return [false, dupMsg(kind)];
+  const { data, error } = await supabase.from(kind).insert({ name }).select().single();
+  if (error) return [false, error.code === "23505" ? `${dupMsg(kind)} (added by someone else — press Refresh)` : errText(error)];
+  state[kind].push(toItem(data));
   return [true, `${label} '${name}' added successfully.`];
 }
 
-export function updateItem(kind, rowId, name) {
+export async function updateItem(kind, rowId, name) {
   name = String(name ?? "").trim();
   const label = LABEL[kind];
   if (!name) return [false, `${label} name cannot be empty.`];
-  if (state[kind].some((x) => x.row_id !== rowId && norm(x.name) === norm(name))) return [false, `${label} ${kind === "factories" ? "name " : ""}already exists.`];
+  if (state[kind].some((x) => x.row_id !== rowId && norm(x.name) === norm(name))) return [false, dupMsg(kind)];
   const it = state[kind].find((x) => x.row_id === rowId);
   if (!it) return [false, `${label} not found.`];
+  const { data, error } = await supabase.from(kind).update({ name }).eq("row_id", rowId).select();
+  if (error) return [false, error.code === "23505" ? dupMsg(kind) : errText(error)];
+  if (!data.length) return [false, NO_PERM];
   it.name = name;
-  persist();
   return [true, `${label} updated successfully.`];
 }
 
-export function deleteItem(kind, rowId) {
+export async function deleteItem(kind, rowId) {
   const i = state[kind].findIndex((x) => x.row_id === rowId);
   if (i < 0) return [false, `${LABEL[kind]} not found.`];
+  const { data, error } = await supabase.from(kind).delete().eq("row_id", rowId).select();
+  if (error) return [false, errText(error)];
+  if (!data.length) return [false, NO_PERM];
   state[kind].splice(i, 1);
-  persist();
   return [true, `${LABEL[kind]} deleted successfully.`];
 }
 
@@ -143,46 +125,65 @@ export const getActiveProducts = () => state.products.filter((p) => !isRemoved(p
 export const getRemovedProducts = () => state.products.filter(isRemoved).map((p) => ({ ...p }));
 export const searchByBarcode = (bc) => getActiveProducts().find((p) => p.barcode === String(bc).trim()) || null;
 
-export function saveProduct(barcode, factory, factory_code, category, color, size) {
-  const ex = state.products.find((p) => String(p.barcode) === String(barcode));
+const findLocal = (barcode) => state.products.find((x) => String(x.barcode) === String(barcode));
+
+async function patchProduct(barcode, fields) {
+  const { data, error } = await supabase.from("products").update(fields).eq("barcode", String(barcode)).select("barcode");
+  if (error) return [false, errText(error)];
+  if (!data.length) return [false, NO_PERM];
+  return [true, ""];
+}
+
+export async function saveProduct(barcode, factory, factory_code, category, color, size) {
+  const ex = findLocal(barcode);
   if (ex) {
     if (isRemoved(ex)) {
+      const [ok, msg] = await patchProduct(barcode, { status: "", removed_date: "" });
+      if (!ok) return [false, msg];
       ex.status = ""; ex.removed_date = "";
-      persist();
       return [true, "Barcode restored from removed items."];
     }
     return [false, "Barcode already exists in database."];
   }
-  state.products.push({
+  const row = {
     barcode: String(barcode), factory, factory_code, category, color, size,
     date: nowStr(), asin: "", noon_sku: "", status: "", removed_date: "",
-  });
-  persist();
+  };
+  const { error } = await supabase.from("products").insert(row);
+  if (error) {
+    if (error.code === "23505") { await reload().catch(() => {}); return [false, "Barcode already exists in database."]; }
+    return [false, errText(error)];
+  }
+  state.products.push(toProduct(row));
   return [true, "Product saved successfully."];
 }
 
-export function removeProduct(barcode) {
-  const p = state.products.find((x) => String(x.barcode) === String(barcode));
+export async function removeProduct(barcode) {
+  const p = findLocal(barcode);
   if (!p) return [false, "Product not found."];
-  p.status = "Removed"; p.removed_date = nowStr();
-  persist();
+  const removed_date = nowStr();
+  const [ok, msg] = await patchProduct(barcode, { status: "Removed", removed_date });
+  if (!ok) return [false, msg];
+  p.status = "Removed"; p.removed_date = removed_date;
   return [true, "Barcode removed."];
 }
 
-export function restoreProduct(barcode) {
-  const p = state.products.find((x) => String(x.barcode) === String(barcode));
+export async function restoreProduct(barcode) {
+  const p = findLocal(barcode);
   if (!p) return [false, "Product not found."];
+  const [ok, msg] = await patchProduct(barcode, { status: "", removed_date: "" });
+  if (!ok) return [false, msg];
   p.status = ""; p.removed_date = "";
-  persist();
   return [true, "Barcode restored."];
 }
 
-export function updateProductExtra(barcode, asin, noon) {
-  const p = state.products.find((x) => String(x.barcode) === String(barcode));
+export async function updateProductExtra(barcode, asin, noon) {
+  const p = findLocal(barcode);
   if (!p) return [false, "Product not found."];
-  p.asin = String(asin ?? "").trim();
-  p.noon_sku = String(noon ?? "").trim();
-  persist();
+  const a = String(asin ?? "").trim(), n = String(noon ?? "").trim();
+  const [ok, msg] = await patchProduct(barcode, { asin: a, noon_sku: n });
+  if (!ok) return [false, msg];
+  p.asin = a; p.noon_sku = n;
   return [true, "Saved."];
 }
 
@@ -208,9 +209,16 @@ async function XLSX() { return (await import("xlsx")).default || (await import("
 
 const cellStr = (v) => (v === null || v === undefined ? "" : String(v).trim());
 
+/**
+ * Import ADDS what is missing from the shared database (matched by name / barcode).
+ * Nothing existing is changed or deleted, so importing twice is harmless.
+ */
 export async function importWorkbook(arrayBuffer) {
   const X = await XLSX();
   const wb = X.read(arrayBuffer, { type: "array", cellDates: false });
+  if (!wb.SheetNames.some((n) => ["Factories", "Products"].includes(n))) {
+    return [false, "This file doesn't look like a COMVEX Database.xlsx (no Factories / Products sheet)."];
+  }
   const next = empty();
 
   for (const [kind, [sheet, nameHdr]] of Object.entries(LIST_SHEETS)) {
@@ -245,12 +253,48 @@ export async function importWorkbook(arrayBuffer) {
     });
   }
 
-  if (!wb.SheetNames.some((n) => ["Factories", "Products"].includes(n))) {
-    return [false, "This file doesn't look like a COMVEX Database.xlsx (no Factories / Products sheet)."];
+  const added = { factories: 0, categories: 0, colors: 0, sizes: 0, products: 0 };
+  let skipped = 0;
+  const finish = async (ok, msg) => { await reload().catch(() => {}); return [ok, msg]; };
+
+  // lists first (keep the file's Row IDs when free, otherwise next free number)
+  for (const kind of Object.keys(LIST_SHEETS)) {
+    const have = new Set(state[kind].map((x) => norm(x.name)));
+    const used = new Set(state[kind].map((x) => x.row_id));
+    let max = state[kind].reduce((m, x) => Math.max(m, x.row_id), 0);
+    const rows = [];
+    for (const it of next[kind]) {
+      const n = norm(it.name);
+      if (!n || have.has(n)) continue;
+      have.add(n);
+      let id = it.row_id;
+      if (!Number.isFinite(id) || id <= 0 || used.has(id)) id = max + 1;
+      used.add(id); max = Math.max(max, id);
+      rows.push({ row_id: id, name: it.name });
+    }
+    if (!rows.length) continue;
+    const { error } = await supabase.from(kind).insert(rows);
+    if (error) return finish(false, `Import stopped at ${LABEL[kind]} list: ${errText(error)}`);
+    added[kind] = rows.length;
   }
-  state = next;
-  persist();
-  return [true, `Imported ${next.factories.length} factories, ${next.categories.length} categories, ${next.colors.length} colors, ${next.sizes.length} sizes and ${next.products.length} barcodes.`];
+
+  // products in chunks
+  const seen = new Set(state.products.map((p) => p.barcode));
+  const fresh = [];
+  for (const p of next.products) {
+    if (seen.has(p.barcode)) { skipped++; continue; }
+    seen.add(p.barcode);
+    fresh.push(p);
+  }
+  for (let i = 0; i < fresh.length; i += 500) {
+    const chunk = fresh.slice(i, i + 500);
+    const { data, error } = await supabase.from("products").upsert(chunk, { onConflict: "barcode", ignoreDuplicates: true }).select("barcode");
+    if (error) return finish(false, `Import stopped after ${added.products} barcodes: ${errText(error)}`);
+    added.products += data.length;
+    skipped += chunk.length - data.length;
+  }
+
+  return finish(true, `Imported ${added.factories} factories, ${added.categories} categories, ${added.colors} colors, ${added.sizes} sizes and ${added.products} barcodes` + (skipped ? ` (${skipped} barcodes already existed and were skipped).` : "."));
 }
 
 function sheetFromRows(X, rows, widths) {
