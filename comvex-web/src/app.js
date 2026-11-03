@@ -16,6 +16,7 @@ const NAV = [
   ["categories", "📂", "Categories", "Manage categories"],
   ["colors", "🎨", "Colors", "Manage colors"],
   ["sizes", "📐", "Sizes", "Manage sizes"],
+  ["users", "👥", "Users", "Manage users & permissions"],
 ];
 const CRUD = {
   factories: { icon: "🏭", title: "Factory Management", sub: "Manage production factories", one: "factory", sheet: "Factories", hdr: "Factory Name" },
@@ -23,6 +24,8 @@ const CRUD = {
   colors: { icon: "🎨", title: "Color Management", sub: "Manage product colors", one: "color", sheet: "Colors", hdr: "Color Name" },
   sizes: { icon: "📐", title: "Size Management", sub: "Manage product sizes", one: "size", sheet: "Sizes", hdr: "Size Name" },
 };
+const PAGE_PERM = { dashboard: "view_dashboard", products: "view_products", factories: "view_lists", categories: "view_lists", colors: "view_lists", sizes: "view_lists", users: "manage_users" };
+const can = (perm) => auth.can(user, perm);
 const STAT_COLORS = { factories: "#5B5EF7", categories: "#22C55E", colors: "#3B82F6", sizes: "#A855F7", barcodes: "#F59E0B" };
 
 let user = "";
@@ -157,7 +160,7 @@ function renderLogin() {
 
 // ── shell ──────────────────────────────────────────────────────
 function renderShell() {
-  const navHtml = NAV.map(([id, ic, label]) => `<button class="nav-btn" data-nav="${id}"><span class="ic">${ic}</span>${label}</button>`).join("");
+  const navHtml = NAV.filter((n) => can(PAGE_PERM[n[0]])).map(([id, ic, label]) => `<button class="nav-btn" data-nav="${id}"><span class="ic">${ic}</span>${label}</button>`).join("");
   app.innerHTML = `<div class="shell">
     <aside class="sidebar" id="sidebar">
       <div class="logo-wrap"><img src="/assets/icons/comvex_logo.png" alt="COMVEX"></div><hr class="rule">
@@ -205,6 +208,10 @@ function tick() {
 }
 
 function navigate(id) {
+  if (!can(PAGE_PERM[id])) {
+    id = NAV.map((n) => n[0]).find((x) => can(PAGE_PERM[x]));
+    if (!id) { $("#page").innerHTML = `<div class="empty">Your account has no access to any page. Ask an administrator.</div>`; return; }
+  }
   page = id; toggleSidebar(false);
   $$("[data-nav]").forEach((b) => b.classList.toggle("active", b.dataset.nav === id));
   const [, , title, sub] = NAV.find((n) => n[0] === id);
@@ -212,6 +219,7 @@ function navigate(id) {
   const el = $("#page"); el.scrollTop = 0;
   if (id === "dashboard") renderDashboard(el);
   else if (id === "products") renderProducts(el);
+  else if (id === "users") renderUsers(el);
   else renderCrud(el, id);
 }
 function focusSearch() { navigate("dashboard"); const i = $("#q"); if (i) { i.focus(); i.select(); } }
@@ -274,7 +282,7 @@ function renderProducts(el) {
         <form class="gen-form" id="gen" autocomplete="off">
           ${[["Factory", "gf", "factories"], ["Category", "gc", "categories"], ["Color", "gcol", "colors"], ["Size", "gsz", "sizes"]].map(([l, id, k]) => `<div class="line"><span class="flabel">${l}</span><select id="${id}">${opts(k)}</select></div>`).join("")}
           <div class="line"><span class="flabel">Factory Code</span><input id="fcode" type="text" placeholder="e.g. 205" inputmode="text" autocapitalize="off"></div>
-          <button class="btn primary lg" type="submit">Generate Barcode</button>
+          <button class="btn primary lg" type="submit" ${can("generate") ? "" : "disabled"}>Generate Barcode</button>
         </form>
         <div class="gen-form">
           <div class="barcode-box" id="preview"></div>
@@ -299,6 +307,7 @@ function renderProducts(el) {
 
   $("#gen").onsubmit = (e) => {
     e.preventDefault();
+    if (!can("generate")) return warn("You don't have permission to generate barcodes.");
     const f = $("#gf").value, c = $("#gc").value, col = $("#gcol").value, sz = $("#gsz").value, code = $("#fcode").value.trim();
     if (!code) return warn("Please enter the Factory Code.");
     if (!(f && c && col && sz)) return warn("Select Factory, Category, Color and Size — add them in the Factories / Categories / Colors / Sizes pages first.");
@@ -313,6 +322,7 @@ function renderProducts(el) {
   };
   $("#print").onclick = async () => { if (!ui.lastGen) return warn("Generate a barcode first before printing."); await printBarcode(ui.lastGen.bc); };
   $("#png").onclick = async () => {
+    if (!can("export")) return warn("You don't have permission to export.");
     if (!ui.lastGen) return warn("Generate a barcode first before exporting.");
     const [ok, m] = await exportBarcodePng(ui.lastGen.bc); ok ? success(`Saved ${m}`) : failure(m);
   };
@@ -341,6 +351,7 @@ function renderProducts(el) {
 }
 
 async function showProduct(barcode) {
+  if (!can("view_products")) return warn("You don't have permission to view products.");
   const p = db.searchByBarcode(barcode);
   if (!p) return warn(`Barcode ${barcode} was not found in the database.`);
   const val = (v) => esc(v === null || v === undefined || v === "" ? "—" : v);
@@ -359,6 +370,9 @@ async function showProduct(barcode) {
   const asin = $("#pd-asin", m.el), noon = $("#pd-noon", m.el), msg = $("#pd-msg", m.el);
   const dirty = () => asin.value.trim() !== saved.asin.trim() || noon.value.trim() !== saved.noon.trim();
   const setMsg = (t, cls = "") => { msg.textContent = t; msg.className = `msg ${cls}`; };
+  if (!can("edit_product")) { asin.readOnly = noon.readOnly = true; $("#pd-save", m.el).hidden = true; }
+  if (!can("remove_product")) $("#pd-remove", m.el).hidden = true;
+  if (!can("export")) $("#pd-png", m.el).hidden = true;
   mountBarcode($("#pd-img", m.el), p.barcode);
   const onEdit = () => setMsg(dirty() ? "Unsaved changes" : "");
   asin.oninput = noon.oninput = onEdit;
@@ -410,23 +424,76 @@ function renderCrud(el, kind) {
     const n = items.length; $("#ccount").textContent = `${n} ${cfg.one}${n !== 1 ? "s" : ""} total`;
   };
   const done = ([ok, m]) => { ok ? success(m) : failure(m); if (ok) draw(); return ok; };
-  const add = async () => { const v = await promptBox(`Add ${cap(cfg.one)}`, cfg.hdr); if (v !== null) done(db.addItem(kind, v)); };
+  const add = async () => {
+    if (!can("add_list")) return; const v = await promptBox(`Add ${cap(cfg.one)}`, cfg.hdr); if (v !== null) done(db.addItem(kind, v)); };
   const edit = async () => {
+    if (!can("edit_list")) return;
     if (ui.crudSel === null) return warn(`Select a ${cfg.one}.`);
     const cur = db.getAll(kind).find((i) => i.row_id === ui.crudSel);
     const v = await promptBox(`Edit ${cap(cfg.one)}`, cfg.hdr, cur?.name || ""); if (v !== null) done(db.updateItem(kind, ui.crudSel, v));
   };
   const del = async () => {
+    if (!can("delete_list")) return;
     if (ui.crudSel === null) return warn(`Select a row to delete.`);
     if (await confirmBox(`Are you sure you want to delete this ${cfg.one}?\n\nHeads-up: barcodes use each item's position in the list, so deleting one shifts the position of the items below it.`, { title: `Delete ${cfg.one}`, yes: "Delete", danger: true })) done(db.deleteItem(kind, ui.crudSel));
   };
   $("#add").onclick = add; $("#edit").onclick = edit; $("#del").onclick = del;
   $("#ref").onclick = draw;
+  $("#add").hidden = !can("add_list"); $("#edit").hidden = !can("edit_list"); $("#del").hidden = !can("delete_list"); $("#exp").hidden = !can("export");
   $("#cf").oninput = (e) => { ui.crudFilter = e.target.value; draw(); };
   $("#exp").onclick = async () => { download(await db.buildWorkbook(cfg.sheet), `${cfg.one}s_export.xlsx`, XLSX_TYPE); success(`Exported ${cfg.one}s_export.xlsx`); };
   draw();
 }
 const cap = (s) => s[0].toUpperCase() + s.slice(1);
+
+// ── user management ────────────────────────────────────────────
+function renderUsers(el) {
+  const rows = auth.listUsers();
+  el.innerHTML = `<div class="page-inner"><div><h2 style="margin:0;font-size:22px;letter-spacing:-.3px">👥  User Management</h2><p class="card-hint" style="font-size:13px">Create users and choose what each one can see and do</p></div>
+    <section class="card"><div class="row"><button class="btn add" id="u-add">+ Add User</button></div>
+      <hr class="rule" style="margin:16px 0 4px"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Username</th><th>Role</th><th>Access</th><th>Last login</th><th></th></tr></thead><tbody>
+      ${rows.map((u) => `<tr><td><b>${esc(u.username)}</b>${u.username === user ? ' <span class="card-hint">(you)</span>' : ""}</td><td>${esc(u.role)}</td>
+        <td class="card-hint">${u.perms.length} of ${auth.PERMS.length} permissions</td>
+        <td class="card-hint">${u.last_login ? esc(new Date(u.last_login).toLocaleString("en-GB")) : "Never"}</td>
+        <td><div class="row" style="justify-content:flex-end"><button class="btn ghost" style="min-height:32px;padding:4px 14px" data-edit="${esc(u.username)}">Edit</button><button class="btn danger" style="min-height:32px;padding:4px 14px" data-del="${esc(u.username)}">Delete</button></div></td></tr>`).join("")}
+      </tbody></table></div></section></div>`;
+  $("#u-add").onclick = () => userDialog(null);
+  $$("[data-edit]", el).forEach((b) => (b.onclick = () => userDialog(rows.find((u) => u.username === b.dataset.edit))));
+  $$("[data-del]", el).forEach((b) => (b.onclick = async () => {
+    const name = b.dataset.del;
+    if (!(await confirmBox(`Delete user '${name}'?\n\nThey will no longer be able to sign in.`, { title: "Delete user", yes: "Delete", danger: true }))) return;
+    const [ok, msg] = auth.deleteUser(name, user);
+    ok ? success(msg) : failure(msg);
+    if (ok) renderUsers(el);
+  }));
+}
+
+function userDialog(existing) {
+  const edit = !!existing;
+  const perms = new Set(existing?.perms ?? auth.ROLE_PRESETS.Viewer);
+  const m = modal(`<div class="dlg-body"><h3 class="dlg-title">${edit ? "Edit User" : "Add User"}</h3>
+    <div class="field"><label>Username</label><input id="uf-name" type="text" value="${esc(existing?.username || "")}" ${edit ? "disabled" : ""} autocapitalize="off" autocomplete="off"></div>
+    <div class="field"><label>${edit ? "New password (leave empty to keep)" : "Password"}</label><input id="uf-pw" type="password" autocomplete="new-password"></div>
+    <div class="field"><label>Role (fills the permissions below)</label><select id="uf-role">${auth.ROLES.map((r) => `<option ${r === (existing?.role || "Viewer") ? "selected" : ""}>${r}</option>`).join("")}</select></div>
+    <div class="field"><label>Permissions</label><div class="check-grid" id="uf-perms">${auth.PERMS.map(([k, l]) => `<label class="check"><input type="checkbox" value="${k}" ${perms.has(k) ? "checked" : ""}>${esc(l)}</label>`).join("")}</div></div>
+    <div class="msg err" id="uf-err" role="alert"></div></div>
+    <div class="dlg-foot"><span class="spacer"></span><button class="btn quiet" id="uf-x">Cancel</button><button class="btn primary" id="uf-ok">${edit ? "Save" : "Create"}</button></div>`);
+  const boxes = $$("#uf-perms input", m.el), role = $("#uf-role", m.el);
+  const lock = () => boxes.forEach((b) => { b.disabled = role.value === "Administrator"; if (b.disabled) b.checked = true; });
+  role.onchange = () => { const pr = auth.ROLE_PRESETS[role.value]; boxes.forEach((b) => (b.checked = pr.includes(b.value))); lock(); };
+  lock();
+  $("#uf-x", m.el).onclick = () => m.close();
+  $("#uf-ok", m.el).onclick = async () => {
+    const sel = boxes.filter((b) => b.checked).map((b) => b.value);
+    const [ok, msg] = edit
+      ? await auth.updateUser(existing.username, { role: role.value, perms: sel, password: $("#uf-pw", m.el).value })
+      : await auth.createUser($("#uf-name", m.el).value, $("#uf-pw", m.el).value, role.value, sel);
+    if (!ok) { $("#uf-err", m.el).textContent = msg; return; }
+    success(msg); m.close(true);
+    if (edit && existing.username === user) renderShell(); else navigate("users");
+  };
+  $((edit ? "#uf-pw" : "#uf-name"), m.el).focus();
+}
 
 // ── profile & security ─────────────────────────────────────────
 function openProfile() {
@@ -470,6 +537,7 @@ function openProfile() {
     if (!ok) return failure(msg);
     success("Password changed successfully."); ["#op", "#np", "#cp"].forEach((s) => ($(s, m.el).value = ""));
   };
+  $("#bk", m.el).hidden = !can("export"); $("#im", m.el).hidden = !can("import");
   $("#bk", m.el).onclick = async () => {
     const d = new Date(), p = (x) => String(x).padStart(2, "0");
     download(await db.buildWorkbook(), `Database_backup_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}.xlsx`, XLSX_TYPE);
@@ -501,5 +569,5 @@ function openProfile() {
     } catch { /* start empty */ }
   }
   user = auth.getSession();
-  if (user) renderShell(); else renderLogin();
+  if (user && auth.exists(user)) renderShell(); else renderLogin();
 })();
